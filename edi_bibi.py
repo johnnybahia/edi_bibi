@@ -20,7 +20,17 @@ VALOR_B_15D = "060000000000000"                 # col. 103-117 (15 dígitos)
 CAMPO_MISTO_29D = "05645301000196000000000000750"  # col. 199-227 (29 dígitos)
 
 UN_PADRAO = "MT"
-TIPO_REGRA = "primeiro_02_restante_01"  # "todos_01" | "todos_02"
+
+# Preenchimento das colunas 25-26 (sequencia do item dentro da OC):
+#   "sequencia_item"          -> usa o "Dif. Item" do PDF (1 -> "01", 2 -> "02", ...)
+#   "primeiro_02_restante_01" -> comportamento antigo (1o registro "02", demais "01")
+#   "todos_01" | "todos_02"   -> valor fixo
+TIPO_REGRA = "sequencia_item"
+
+# Conteudo do campo descricao (col. 260-334):
+#   "produto" -> apenas a descricao do produto
+#   "legado"  -> SEQ + descricao + NCM + UN + "1 MATERIA PRIMA" (formato antigo)
+DESCRICAO_FORMATO = "produto"
 
 # ========================= UTILS ==========================
 def so_digitos(s: str) -> str:
@@ -186,13 +196,22 @@ _ITEM_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+def montar_descricao_edi(seq: int, desc_produto: str, ncm: str, un: str) -> str:
+    """Monta o campo descrição (col. 260-334) conforme DESCRICAO_FORMATO."""
+    if DESCRICAO_FORMATO == "legado":
+        return ascii_upper(f"{seq}{desc_produto} {ncm} {un} 1 MATERIA PRIMA")[:75]
+    return ascii_upper(desc_produto)[:75]
+
 def parse_itens(text: str) -> List[Dict]:
     """
     Parser orientado à linha completa de item da tabela BIBI.
     Cada item ocupa uma linha com: código, seq+desc, NCM, UN, qtd, preço, data.
     Linhas de continuação de descrição (sem código no início) são ignoradas.
+    Itens repetidos (mesmo código + mesma sequência) são descartados, para que
+    uma linha lida duas vezes no texto do PDF não vire dois registros no EDI.
     """
     itens: List[Dict] = []
+    vistos = set()
     for raw_ln in text.splitlines():
         ln = raw_ln.strip()
         if not ln:
@@ -202,7 +221,7 @@ def parse_itens(text: str) -> List[Dict]:
             continue
 
         codigo   = m.group(1).zfill(6)
-        seq      = m.group(2)
+        seq      = int(m.group(2))
         desc_raw = re.sub(r"\s+", " ", m.group(3)).strip()
         ncm      = m.group(4)
         un       = m.group(5)[:2].upper()
@@ -210,15 +229,21 @@ def parse_itens(text: str) -> List[Dict]:
         preco    = safe_float(m.group(7)) or 0.0
         data_fim = yyyymmdd_from_br(m.group(8))
 
-        # Descrição no EDI: SEQ + desc_produto + NCM + UN + 1 MATERIA PRIMA
-        desc_edi = ascii_upper(f"{seq}{desc_raw} {ncm} {un} 1 MATERIA PRIMA")[:75]
+        desc_edi = montar_descricao_edi(seq, desc_raw, ncm, un)
 
         if qtd == 0.0:
             print(f"[WARN] Item {codigo} com quantidade zero, ignorado.")
             continue
 
+        chave = (codigo, seq)
+        if chave in vistos:
+            print(f"[WARN] Item {codigo} (seq {seq}) duplicado no PDF, ignorado.")
+            continue
+        vistos.add(chave)
+
         itens.append({
             "CODIGO6":   codigo,
+            "SEQ":       seq,
             "QTD":       qtd,
             "PRECO":     preco,
             "UN":        un,
@@ -276,7 +301,10 @@ def montar_edi_para_texto(cnpj14: str, oc_raw: str, data_ini: str, itens: List[D
 
     lines = []
     for idx, it in enumerate(itens, start=1):
-        if TIPO_REGRA == "primeiro_02_restante_01":
+        seq_item = int(it.get("SEQ") or idx)
+        if TIPO_REGRA == "sequencia_item":
+            tipo = str(seq_item).zfill(2)[-2:]
+        elif TIPO_REGRA == "primeiro_02_restante_01":
             tipo = "02" if idx == 1 else "01"
         elif TIPO_REGRA == "todos_02":
             tipo = "02"
